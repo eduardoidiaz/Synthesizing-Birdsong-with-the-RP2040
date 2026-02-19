@@ -115,10 +115,12 @@ uint16_t DAC_data_0 ; // output value
 // State machine variables
 volatile unsigned int STATE_0 = 0 ;
 volatile unsigned int count_0 = 0 ;
+volatile unsigned int STATE_KEYPRESSED = 0;
 
 // GPIO ISR. Toggles LED
 void gpio_callback() {
     gpio_put(LED, !gpio_get(LED));
+    STATE_KEYPRESSED = 1;
 }
 
 // This timer ISR is called on core 0
@@ -133,7 +135,7 @@ static void alarm_irq(void) {
     // Reset the alarm register
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
 
-    if (STATE_0 == 0) {
+    if (STATE_KEYPRESSED) {
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0  ;
         DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
@@ -159,18 +161,9 @@ static void alarm_irq(void) {
 
         // State transition?
         if (count_0 == BEEP_DURATION) {
-            STATE_0 = 1 ;
+            STATE_KEYPRESSED = 0;
             count_0 = 0 ;
-        }
-    }
-
-    // State transition?
-    else {
-        count_0 += 1 ;
-        if (count_0 == BEEP_REPEAT_INTERVAL) {
-            current_amplitude_0 = 0 ;
-            STATE_0 = 0 ;
-            count_0 = 0 ;
+            current_amplitude_0 = 0;
         }
     }
 
