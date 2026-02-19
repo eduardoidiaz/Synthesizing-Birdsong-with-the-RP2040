@@ -62,8 +62,10 @@ typedef signed int fix15 ;
 
 //Direct Digital Synthesis (DDS) parameters
 #define two32 4294967296.0  // 2^32 (a constant)
-#define Fs 50000
-#define DELAY 20 // 1/Fs (in microseconds)
+#define Fs 44000
+#define DELAY 22 // 1/Fs (in microseconds)
+
+volatile unsigned int desired_frequency;
 
 // the DDS units - core 0
 // Phase accumulator and phase increment. Increment sets output frequency.
@@ -136,28 +138,37 @@ static void alarm_irq(void) {
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
 
     if (STATE_KEYPRESSED) {
-        // DDS phase and sine table lookup
-        phase_accum_main_0 += phase_incr_main_0  ;
-        DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
-            sin_table[phase_accum_main_0>>24])) + 2048 ;
+        // Compute frequency for swoop
+        for (int j=0; j<5720; j++) {
+            desired_frequency = 260*sin((3.14/5200)*j) + 1740;
+            phase_incr_main_0 = (desired_frequency*two32)/Fs;
+            // DDS phase and sine table lookup
+            phase_accum_main_0 += phase_incr_main_0;
+            DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
+            sin_table[phase_accum_main_0>>24])) + 2048;
 
-        // Ramp up amplitude
-        if (count_0 < ATTACK_TIME) {
-            current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
+            // Ramp up amplitude
+            if (count_0 < ATTACK_TIME) {
+                current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
+            }
+            // Ramp down amplitude
+            else if (count_0 > BEEP_DURATION - DECAY_TIME) {
+                current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
+            }
+
+            // Mask with DAC control bits
+            DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
+
+            // SPI write (no spinlock b/c of SPI buffer)
+            spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+
+            // Increment the counter
+            count_0 += 1 ;
         }
-        // Ramp down amplitude
-        else if (count_0 > BEEP_DURATION - DECAY_TIME) {
-            current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
-        }
 
-        // Mask with DAC control bits
-        DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
-
-        // SPI write (no spinlock b/c of SPI buffer)
-        spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
-
-        // Increment the counter
-        count_0 += 1 ;
+        STATE_KEYPRESSED = 0;
+        count_0 = 0 ;
+        current_amplitude_0 = 0;
 
         // State transition?
         if (count_0 == BEEP_DURATION) {
