@@ -127,25 +127,19 @@ unsigned int button = 0x70 ;
 
 
 // State machine variables
-volatile unsigned int STATE_0 = 0 ;
-volatile unsigned int count_0 = 0 ;
-volatile unsigned int STATE_KEYPRESSED = 0;
 volatile unsigned int STATE_KEY1_PRESSED = 0;
 volatile unsigned int STATE_KEY2_PRESSED = 0;
-
-// GPIO ISR. Toggles LED
-void gpio_callback() {
-    gpio_put(LED, !gpio_get(LED));
-    STATE_KEYPRESSED = 1;
-    STATE_KEY1_PRESSED = possible_keycode == keycodes[1];
-    STATE_KEY2_PRESSED = possible_keycode == keycodes[2];
-}
+volatile unsigned int STATE_KEY3_PRESSED = 0;
+volatile unsigned int STATE_KEY3_PREV_PRESSED = 0;
+volatile unsigned int freq_count_swoop = 0;
+volatile unsigned int freq_count_chirp = 0;
+volatile unsigned int freq_count_silence = 0;
 
 // This timer ISR is called on core 0
 static void alarm_irq(void) {
 
     // Assert a GPIO when we enter the interrupt
-    // gpio_put(ISR_GPIO, 1) ;
+    gpio_put(ISR_GPIO, 1) ;
 
     // Clear the alarm irq
     hw_clear_bits(&timer_hw->intr, 1u << ALARM_NUM);
@@ -154,67 +148,98 @@ static void alarm_irq(void) {
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
 
     if (STATE_KEY1_PRESSED) {
-        gpio_put(ISR_GPIO, 1) ;
+        if (STATE_KEY3_PRESSED) {
+            printf("STATE_KEY3_PRESSED and STATE_KEY1_PRESSED\n");
+            printf("STATE_KEY3_PRESSED and STATE_KEY1_PRESSED freq_count_silence: %d\n", freq_count_silence);
+            // printf("STATE_KEY3_PRESSED and STATE_KEY1_PRESSED (time_us_32): %u\n", time_us_32());
+            freq_count_silence = 0;
+        }
         // Compute frequency for swoop
-        for (int j=0; j<5720; j++) {
-            desired_frequency = 260*sin((3.14/5200)*j) + 1740;
-            phase_incr_main_0 = (desired_frequency*two32)/Fs;
-            // DDS phase and sine table lookup
-            phase_accum_main_0 += phase_incr_main_0;
-            DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
-            sin_table[phase_accum_main_0>>24])) + 2048;
+        desired_frequency = 260*sin((3.14/5200)*freq_count_swoop) + 1740;
+        phase_incr_main_0 = (desired_frequency*two32)/Fs;
+        // DDS phase and sine table lookup
+        phase_accum_main_0 += phase_incr_main_0;
+        DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
+        sin_table[phase_accum_main_0>>24])) + 2048;
 
-            // Ramp up amplitude
-            if (j < ATTACK_TIME) {
-                current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
-            }
-            // Ramp down amplitude
-            else if (j > BEEP_DURATION - DECAY_TIME) {
-                current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
-            }
-
-            // Mask with DAC control bits
-            DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
-
-            // SPI write (no spinlock b/c of SPI buffer)
-            spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+        // Ramp up amplitude
+        if (freq_count_swoop < ATTACK_TIME) {
+            current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
+        }
+        // Ramp down amplitude
+        else if (freq_count_swoop > BEEP_DURATION - DECAY_TIME) {
+            current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
         }
 
-        STATE_KEY1_PRESSED = 0;
-        current_amplitude_0 = 0;
-        gpio_put(ISR_GPIO, 0) ;
+        // Mask with DAC control bits
+        DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
+
+        // SPI write (no spinlock b/c of SPI buffer)
+        spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+
+        freq_count_swoop += 1;
+        
+
+        if (freq_count_swoop == 5720) {
+            STATE_KEY1_PRESSED = 0;
+            current_amplitude_0 = 0;
+            freq_count_swoop = 0;
+            // irq_set_enabled(ALARM_IRQ, false);
+        }
     }
 
     if (STATE_KEY2_PRESSED) {
-        gpio_put(ISR_GPIO, 1) ;
+        // if (STATE_KEY3_PRESSED) {
+        //     printf("STATE_KEY3_PRESSED and STATE_KEY2_PRESSED\n");
+        //     printf("STATE_KEY3_PRESSED and STATE_KEY2_PRESSED freq_count_silence: %d\n", freq_count_silence);
+        //     // printf("STATE_KEY3_PRESSED and STATE_KEY2_PRESSED (time_us_32): %u\n", time_us_32());
+        //     freq_count_silence = 0;
+        // }
         // Compute frequency for chirp
-        for (int j=0; j<5720; j++) {
-            desired_frequency = (1.84e-4) * pow(j, 2) + 2000;
-            phase_incr_main_0 = (desired_frequency*two32)/Fs;
-            // DDS phase and sine table lookup
-            phase_accum_main_0 += phase_incr_main_0;
-            DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
-            sin_table[phase_accum_main_0>>24])) + 2048;
+        desired_frequency = (1.84e-4) * pow(freq_count_chirp, 2) + 2000;
+        phase_incr_main_0 = (desired_frequency*two32)/Fs;
+        // DDS phase and sine table lookup
+        phase_accum_main_0 += phase_incr_main_0;
+        DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
+        sin_table[phase_accum_main_0>>24])) + 2048;
 
-            // Ramp up amplitude
-            if (j < ATTACK_TIME) {
-                current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
-            }
-            // Ramp down amplitude
-            else if (j > BEEP_DURATION - DECAY_TIME) {
-                current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
-            }
-
-            // Mask with DAC control bits
-            DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
-
-            // SPI write (no spinlock b/c of SPI buffer)
-            spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+        // Ramp up amplitude
+        if (freq_count_chirp < ATTACK_TIME) {
+            current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
+        }
+        // Ramp down amplitude
+        else if (freq_count_chirp > BEEP_DURATION - DECAY_TIME) {
+            current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
         }
 
-        STATE_KEY2_PRESSED = 0;
-        current_amplitude_0 = 0;
-        gpio_put(ISR_GPIO, 0) ;
+        // Mask with DAC control bits
+        DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
+
+        // SPI write (no spinlock b/c of SPI buffer)
+        spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+
+        freq_count_chirp += 1;
+
+        if (freq_count_chirp == 5720) {
+            STATE_KEY2_PRESSED = 0;
+            current_amplitude_0 = 0;
+            freq_count_chirp = 0;
+            // irq_set_enabled(ALARM_IRQ, false);
+        }
+    }
+    
+    if (STATE_KEY3_PRESSED) {
+        if (STATE_KEY3_PREV_PRESSED == 0) {
+            STATE_KEY3_PREV_PRESSED = 1;
+        }
+        freq_count_silence += 1;
+        // printf("freq_count_silence: %d\n", freq_count_silence);
+        // printf("STATE_KEY3_PRESSED = %d\n", STATE_KEY3_PRESSED);
+        // printf("STATE_KEY3_PRESSED (time_us_32): %u\n", time_us_32());
+    }
+
+    if (STATE_KEY3_PREV_PRESSED) {
+        freq_count_silence += 1;
     }
 
     // De-assert the GPIO when we leave the interrupt
@@ -291,12 +316,13 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
                     // Print key to terminal
                     for (int i=0; i<NUMKEYS; i++) {
                         if (possible_keycode == keycodes[i]) {
-                            printf("\n%d", i);
-                            // Raise GPIO 3. This triggers an ISR
-                            gpio_put(3, 1) ;
-                            sleep_ms(150) ;
-                            gpio_put(3, 0) ;
-                            sleep_ms(150) ;
+                            printf("Key Pressed: %d\n", i);
+                            STATE_KEY1_PRESSED = (possible_keycode == keycodes[1]);
+                            STATE_KEY2_PRESSED = (possible_keycode == keycodes[2]);
+                            STATE_KEY3_PRESSED = (possible_keycode == keycodes[3]);
+                            printf("STATE_KEY3_PRESSED = %d\n", STATE_KEY3_PRESSED);
+                            //irq_set_enabled(ALARM_IRQ, true);
+                            //timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
                             break;
                         }
                     }
@@ -329,17 +355,9 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
     PT_END(pt) ;
 }
 
-#define WATCH_PIN 1
 int main() {
-
-    // Overclock
-    // set_sys_clock_khz(150000, true) ;
-
     // Initialize stdio
     stdio_init_all();
-
-    // Configure GPIO interrupt
-    gpio_set_irq_enabled_with_callback(WATCH_PIN, GPIO_IRQ_EDGE_RISE, true, &gpio_callback);
 
     // Map LED to GPIO port, make it low
     gpio_init(LED);
@@ -347,27 +365,21 @@ int main() {
     // Set LED to zero
     gpio_put(LED, 0);
 
-    // Set GPIO's 3 to output
-    gpio_init(3);
-    gpio_set_dir(3, GPIO_OUT);
-    // Set GPIO 3 to zero
-    gpio_put(3, 0) ;
-
     ////////////////// KEYPAD INITS ///////////////////////
     // Initialize the keypad GPIO's
-    gpio_init_mask((0x7F << BASE_KEYPAD_PIN)) ;
+    gpio_init_mask((0x7F << BASE_KEYPAD_PIN));
     // Set row-pins to output
-    gpio_set_dir_out_masked((0xF << BASE_KEYPAD_PIN)) ;
+    gpio_set_dir_out_masked((0xF << BASE_KEYPAD_PIN));
     // Set all output pins to low
-    gpio_put_masked((0xF << BASE_KEYPAD_PIN), (0x0 << BASE_KEYPAD_PIN)) ;
+    gpio_put_masked((0xF << BASE_KEYPAD_PIN), (0x0 << BASE_KEYPAD_PIN));
     // Turn on pulldown resistors for column pins (on by default)
-    gpio_pull_down((BASE_KEYPAD_PIN + 4)) ;
-    gpio_pull_down((BASE_KEYPAD_PIN + 5)) ;
-    gpio_pull_down((BASE_KEYPAD_PIN + 6)) ;
+    gpio_pull_down((BASE_KEYPAD_PIN + 4));
+    gpio_pull_down((BASE_KEYPAD_PIN + 5));
+    gpio_pull_down((BASE_KEYPAD_PIN + 6));
 
     ////////////////// DAC INITS ///////////////////////
     // Initialize SPI channel (channel, baud rate set to 20MHz)
-    spi_init(SPI_PORT, 20000000) ;
+    spi_init(SPI_PORT, 20000000);
     // Format (channel, data bits per transfer, polarity, phase, order)
     spi_set_format(SPI_PORT, 16, 0, 0, 0);
 
@@ -375,21 +387,21 @@ int main() {
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+    gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
 
     // Setup the ISR-timing GPIO
-    gpio_init(ISR_GPIO) ;
+    gpio_init(ISR_GPIO);
     gpio_set_dir(ISR_GPIO, GPIO_OUT);
-    gpio_put(ISR_GPIO, 0) ;
+    gpio_put(ISR_GPIO, 0);
 
     // Map LDAC pin to GPIO port, hold it low (could alternatively tie to GND)
-    gpio_init(LDAC) ;
-    gpio_set_dir(LDAC, GPIO_OUT) ;
-    gpio_put(LDAC, 0) ;
+    gpio_init(LDAC);
+    gpio_set_dir(LDAC, GPIO_OUT);
+    gpio_put(LDAC, 0);
 
     // set up increments for calculating bow envelope
-    attack_inc = divfix(max_amplitude, int2fix15(ATTACK_TIME)) ;
-    decay_inc =  divfix(max_amplitude, int2fix15(DECAY_TIME)) ;
+    attack_inc = divfix(max_amplitude, int2fix15(ATTACK_TIME));
+    decay_inc =  divfix(max_amplitude, int2fix15(DECAY_TIME));
 
     // Build the sine lookup table
     // scaled to produce values between 0 and 4096 (for 12-bit DAC)
@@ -399,13 +411,13 @@ int main() {
     }
 
     // Enable the interrupt for the alarm (we're using Alarm 0)
-    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM) ;
+    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM);
     // Associate an interrupt handler with the ALARM_IRQ
-    irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
+    irq_set_exclusive_handler(ALARM_IRQ, alarm_irq);
     // Enable the alarm interrupt
-    irq_set_enabled(ALARM_IRQ, true) ;
+    irq_set_enabled(ALARM_IRQ, true);
     // Write the lower 32 bits of the target time to the alarm register, arming it.
-    timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
+    timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
 
 
     // Add core 0 threads
