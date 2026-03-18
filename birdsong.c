@@ -157,8 +157,18 @@ static void alarm_irq(void) {
     // Reset the alarm register
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
 
+    // Finished with replay
+    if (replay == 1 && idx > 4) {
+        replay == 0;
+    }
+
+    // Handle replay of recorded key presses
+    // idx -> is set to 0 initially 
+    // Executes: 
+    // 1. silence_time[idx] interrupts (no sound)
+    // 2. when silence_time[idx] == 0, simulate a recorded key press from buttons_pressed[idx]
+    // 3. once the coresponding key press sound finishes 'idx' is incremented and we restart
     if (replay == 1 && STATE_KEY1_PRESSED == 0 && STATE_KEY2_PRESSED == 0) {
-        // printf("%d\n", idx);
         if (silence_time[idx] == 0) {
             STATE_KEY1_PRESSED = buttons_pressed[idx] == 0x11 ? 1 : 0;
             STATE_KEY2_PRESSED = buttons_pressed[idx] == 0x21 ? 1 : 0;
@@ -167,6 +177,7 @@ static void alarm_irq(void) {
         }
     }
 
+    // Key '1' pressed while in play mode
     if (STATE_KEY1_PRESSED & switch_mode==0) {
         // Compute frequency for swoop
         desired_frequency = 260*sin((3.14/5200)*freq_count_swoop) + 1740;
@@ -198,15 +209,15 @@ static void alarm_irq(void) {
             STATE_KEY1_PRESSED = 0;
             current_amplitude_0 = 0;
             freq_count_swoop = 0;
+            // In replay mode increment idx after playing swoop sound
             if (replay == 1) {
                 idx += 1;
             }
-            // idx += 1;
         }
     }
 
+    // Pressed '1' while in record mode
     if (STATE_KEY1_PRESSED & switch_mode==1) {
-        // printf("fq_cnt: %d\n", freq_count_silence);
         silence_time[idx] = freq_count_silence;
         freq_count_silence = 0;
         buttons_pressed[idx] = 0x11;
@@ -214,6 +225,7 @@ static void alarm_irq(void) {
         STATE_KEY1_PRESSED = 0;
     }
 
+    // Key '2' pressed while in play mode
     if (STATE_KEY2_PRESSED & switch_mode==0) {
         // Compute frequency for chirp
         desired_frequency = (1.84e-4) * pow(freq_count_chirp, 2) + 2000;
@@ -244,15 +256,15 @@ static void alarm_irq(void) {
             STATE_KEY2_PRESSED = 0;
             current_amplitude_0 = 0;
             freq_count_chirp = 0;
+            // In replay mode increment idx after playing chirp sound
             if (replay == 1) {
                 idx += 1;
             }
-            // idx += 1;
         }
     }
 
+    // Pressed '2' while in record mode
     if (STATE_KEY2_PRESSED & switch_mode==1) {
-        // printf("fq_cnt: %d\n", freq_count_silence);
         silence_time[idx] = freq_count_silence;
         freq_count_silence = 0;
         buttons_pressed[idx] = 0x21;
@@ -260,6 +272,8 @@ static void alarm_irq(void) {
         STATE_KEY2_PRESSED = 0;
     }
     
+    // No key press while in record mode
+    // Save freq_counts to add the silence in between key presses
     if (STATE_KEY1_PRESSED==0 & STATE_KEY2_PRESSED==0 & switch_mode==1) {
         freq_count_silence += 1;
     }
