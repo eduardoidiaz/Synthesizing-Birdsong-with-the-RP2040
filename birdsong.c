@@ -27,6 +27,9 @@
  * 3.3v (pin 36) -> VCC on DAC 
  * GND (pin 3)  -> GND on DAC 
  * 
+ * EXTERNAL SWITCH CONNECTION
+ * GPIO 0 (pin 1)
+ * 
  */
 
 #include <stdio.h>
@@ -108,6 +111,9 @@ uint16_t DAC_data_0 ; // output value
 //GPIO for timing the ISR
 #define ISR_GPIO 2
 
+// GPIO for External Switch
+#define SWITCH_GPIO 0
+
 // Timing parameters for beeps (units of interrupts)
 #define ATTACK_TIME             1000
 #define DECAY_TIME              1000
@@ -125,15 +131,19 @@ unsigned int keycodes[12] = {   0x28, 0x11, 0x21, 0x41, 0x12,
 unsigned int scancodes[4] = {   0x01, 0x02, 0x04, 0x08} ;
 unsigned int button = 0x70 ;
 
+volatile unsigned int idx = 0;
+volatile unsigned int buttons_pressed[5] = {0, 0, 0, 0, 0};
+volatile unsigned int silence_time[5] = {0, 0, 0, 0, 0};
+
 
 // State machine variables
 volatile unsigned int STATE_KEY1_PRESSED = 0;
 volatile unsigned int STATE_KEY2_PRESSED = 0;
-volatile unsigned int STATE_KEY3_PRESSED = 0;
-volatile unsigned int STATE_KEY3_PREV_PRESSED = 0;
 volatile unsigned int freq_count_swoop = 0;
 volatile unsigned int freq_count_chirp = 0;
 volatile unsigned int freq_count_silence = 0;
+volatile unsigned int switch_mode = 0; // play_mode = 0, record_mode = 1
+volatile unsigned int replay = 0;
 
 // This timer ISR is called on core 0
 static void alarm_irq(void) {
@@ -147,13 +157,17 @@ static void alarm_irq(void) {
     // Reset the alarm register
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
 
-    if (STATE_KEY1_PRESSED) {
-        if (STATE_KEY3_PRESSED) {
-            printf("STATE_KEY3_PRESSED and STATE_KEY1_PRESSED\n");
-            printf("STATE_KEY3_PRESSED and STATE_KEY1_PRESSED freq_count_silence: %d\n", freq_count_silence);
-            // printf("STATE_KEY3_PRESSED and STATE_KEY1_PRESSED (time_us_32): %u\n", time_us_32());
-            freq_count_silence = 0;
+    if (replay == 1 && STATE_KEY1_PRESSED == 0 && STATE_KEY2_PRESSED == 0) {
+        // printf("%d\n", idx);
+        if (silence_time[idx] == 0) {
+            STATE_KEY1_PRESSED = buttons_pressed[idx] == 0x11 ? 1 : 0;
+            STATE_KEY2_PRESSED = buttons_pressed[idx] == 0x21 ? 1 : 0;
+        } else {
+            silence_time[idx] = silence_time[idx] - 1;
         }
+    }
+
+    if (STATE_KEY1_PRESSED & switch_mode==0) {
         // Compute frequency for swoop
         desired_frequency = 260*sin((3.14/5200)*freq_count_swoop) + 1740;
         phase_incr_main_0 = (desired_frequency*two32)/Fs;
@@ -184,17 +198,23 @@ static void alarm_irq(void) {
             STATE_KEY1_PRESSED = 0;
             current_amplitude_0 = 0;
             freq_count_swoop = 0;
-            // irq_set_enabled(ALARM_IRQ, false);
+            if (replay == 1) {
+                idx += 1;
+            }
+            // idx += 1;
         }
     }
 
-    if (STATE_KEY2_PRESSED) {
-        // if (STATE_KEY3_PRESSED) {
-        //     printf("STATE_KEY3_PRESSED and STATE_KEY2_PRESSED\n");
-        //     printf("STATE_KEY3_PRESSED and STATE_KEY2_PRESSED freq_count_silence: %d\n", freq_count_silence);
-        //     // printf("STATE_KEY3_PRESSED and STATE_KEY2_PRESSED (time_us_32): %u\n", time_us_32());
-        //     freq_count_silence = 0;
-        // }
+    if (STATE_KEY1_PRESSED & switch_mode==1) {
+        // printf("fq_cnt: %d\n", freq_count_silence);
+        silence_time[idx] = freq_count_silence;
+        freq_count_silence = 0;
+        buttons_pressed[idx] = 0x11;
+        idx += 1;
+        STATE_KEY1_PRESSED = 0;
+    }
+
+    if (STATE_KEY2_PRESSED & switch_mode==0) {
         // Compute frequency for chirp
         desired_frequency = (1.84e-4) * pow(freq_count_chirp, 2) + 2000;
         phase_incr_main_0 = (desired_frequency*two32)/Fs;
@@ -224,21 +244,23 @@ static void alarm_irq(void) {
             STATE_KEY2_PRESSED = 0;
             current_amplitude_0 = 0;
             freq_count_chirp = 0;
-            // irq_set_enabled(ALARM_IRQ, false);
+            if (replay == 1) {
+                idx += 1;
+            }
+            // idx += 1;
         }
-    }
-    
-    if (STATE_KEY3_PRESSED) {
-        if (STATE_KEY3_PREV_PRESSED == 0) {
-            STATE_KEY3_PREV_PRESSED = 1;
-        }
-        freq_count_silence += 1;
-        // printf("freq_count_silence: %d\n", freq_count_silence);
-        // printf("STATE_KEY3_PRESSED = %d\n", STATE_KEY3_PRESSED);
-        // printf("STATE_KEY3_PRESSED (time_us_32): %u\n", time_us_32());
     }
 
-    if (STATE_KEY3_PREV_PRESSED) {
+    if (STATE_KEY2_PRESSED & switch_mode==1) {
+        // printf("fq_cnt: %d\n", freq_count_silence);
+        silence_time[idx] = freq_count_silence;
+        freq_count_silence = 0;
+        buttons_pressed[idx] = 0x21;
+        idx += 1;
+        STATE_KEY2_PRESSED = 0;
+    }
+    
+    if (STATE_KEY1_PRESSED==0 & STATE_KEY2_PRESSED==0 & switch_mode==1) {
         freq_count_silence += 1;
     }
 
@@ -300,59 +322,71 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
     // Indicate thread beginning
     PT_BEGIN(pt) ;
 
-    while(1) {
+    if (replay == 0) {
 
-        switch (current_state) {
-            case STATE_NOT_PRESSED:
-                possible_keycode = scan_keypad();
-                if (possible_keycode == -1) {
-                    current_state = STATE_NOT_PRESSED;
-                } else {
-                    current_state = STATE_MAYBE_PRESSED;
-                }
-                break;
-            case STATE_MAYBE_PRESSED:
-                if (possible_keycode == scan_keypad()) {
-                    // Print key to terminal
-                    for (int i=0; i<NUMKEYS; i++) {
-                        if (possible_keycode == keycodes[i]) {
-                            printf("Key Pressed: %d\n", i);
-                            STATE_KEY1_PRESSED = (possible_keycode == keycodes[1]);
-                            STATE_KEY2_PRESSED = (possible_keycode == keycodes[2]);
-                            STATE_KEY3_PRESSED = (possible_keycode == keycodes[3]);
-                            printf("STATE_KEY3_PRESSED = %d\n", STATE_KEY3_PRESSED);
-                            //irq_set_enabled(ALARM_IRQ, true);
-                            //timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
-                            break;
-                        }
+        while(1) {
+
+            switch (current_state) {
+                case STATE_NOT_PRESSED:
+                    possible_keycode = scan_keypad();
+                    if (possible_keycode == -1) {
+                        current_state = STATE_NOT_PRESSED;
+                    } else {
+                        current_state = STATE_MAYBE_PRESSED;
                     }
-                    current_state = STATE_PRESSED;
-                } else {
-                    current_state = STATE_NOT_PRESSED;
-                }
-                break;
-            case STATE_PRESSED:
-                if (possible_keycode == scan_keypad()) {
-                    // Do nothing remain in STATE_PRESSED state
-                    current_state = STATE_PRESSED;
-                } else {
-                    current_state = STATE_MAYBE_NOT_PRESSED;
-                }
-                break;
-            case STATE_MAYBE_NOT_PRESSED:
-                if (possible_keycode == scan_keypad()) {
-                    // Transition back to pressed state
-                    current_state = STATE_PRESSED;
-                } else {
-                    current_state = STATE_NOT_PRESSED;
-                }
-                break;
-        }
+                    break;
+                case STATE_MAYBE_PRESSED:
+                    if (possible_keycode == scan_keypad()) {
+                        // Print key to terminal
+                        for (int i=0; i<NUMKEYS; i++) {
+                            if (possible_keycode == keycodes[i]) {
+                                printf("Key Pressed: %d\n", i);
+                                STATE_KEY1_PRESSED = (possible_keycode == keycodes[1]);
+                                STATE_KEY2_PRESSED = (possible_keycode == keycodes[2]);
+                                break;
+                            }
+                        }
+                        current_state = STATE_PRESSED;
+                    } else {
+                        current_state = STATE_NOT_PRESSED;
+                    }
+                    break;
+                case STATE_PRESSED:
+                    if (possible_keycode == scan_keypad()) {
+                        // Do nothing remain in STATE_PRESSED state
+                        current_state = STATE_PRESSED;
+                    } else {
+                        current_state = STATE_MAYBE_NOT_PRESSED;
+                    }
+                    break;
+                case STATE_MAYBE_NOT_PRESSED:
+                    if (possible_keycode == scan_keypad()) {
+                        // Transition back to pressed state
+                        current_state = STATE_PRESSED;
+                    } else {
+                        current_state = STATE_NOT_PRESSED;
+                    }
+                    break;
+            }
 
-        PT_YIELD_usec(30000) ;
+            PT_YIELD_usec(30000) ;
+        }
     }
     // Indicate thread end
     PT_END(pt) ;
+}
+
+// GPIO ISR. Detects External Switch Toggle
+void switch_gpio_record_callback() {
+    if (switch_mode == 0) {
+        printf("Record!\n");
+        switch_mode = 1;
+    } else {
+        printf("Replay!\n");
+        switch_mode = 0;
+        idx = 0;
+        replay = 1;
+    }
 }
 
 int main() {
@@ -364,6 +398,14 @@ int main() {
     gpio_set_dir(LED, GPIO_OUT);
     // Set LED to zero
     gpio_put(LED, 0);
+
+    // Configure Switch (record) GPIO interrupt
+    gpio_set_irq_enabled_with_callback(0, GPIO_IRQ_EDGE_RISE, true, &switch_gpio_record_callback);
+
+    // Set GPIO 0 to input
+    gpio_init(SWITCH_GPIO);
+    gpio_set_dir(SWITCH_GPIO, GPIO_IN);
+    gpio_put(SWITCH_GPIO, 0);
 
     ////////////////// KEYPAD INITS ///////////////////////
     // Initialize the keypad GPIO's
