@@ -150,7 +150,8 @@ fix15 pi = float2fix15(3.14);
 fix15 swoop_samples = int2fix15(5200);
 
 // Chirp equation variables
-
+#define SWOOP_SAMPLES 5720
+uint32_t swoop_table[SWOOP_SAMPLES];
 
 
 // This timer ISR is called on core 0
@@ -188,8 +189,10 @@ static void alarm_irq(void) {
     // Key '1' pressed while in play mode
     if (STATE_KEY1_PRESSED && switch_mode==0) {
         // Compute frequency for swoop 'y = ksin(mx) + b' -> 'y = -260sin(-pi/5200 * x) + 1740' -> approximate freq curve
-        desired_frequency = 260*sin((3.14/5720)*freq_count_swoop) + 1740;
-        phase_incr_main_0 = (desired_frequency*two32)/Fs;
+        // desired_frequency = 260*sin((3.14/5720)*freq_count_swoop) + 1740;
+        // desired_frequency = swoop_table[freq_count_swoop];
+        // phase_incr_main_0 = (desired_frequency*two32)/Fs;
+        phase_incr_main_0 = swoop_table[freq_count_swoop];
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0;
         DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
@@ -474,6 +477,11 @@ int main() {
          sin_table[ii] = float2fix15(2047*sin((float)ii*6.283/(float)sine_table_size));
     }
 
+    for (int i = 0; i < SWOOP_SAMPLES; i++) {
+        float freq = 260 * sin((3.14 / 5720.0) * i) + 1740;
+        swoop_table[i] = (uint32_t)((freq * two32) / Fs);
+    }
+
     // Enable the interrupt for the alarm (we're using Alarm 0)
     hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM);
     // Associate an interrupt handler with the ALARM_IRQ
@@ -482,6 +490,7 @@ int main() {
     irq_set_enabled(ALARM_IRQ, true);
     // Write the lower 32 bits of the target time to the alarm register, arming it.
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
+
 
 
     // Add core 0 threads
