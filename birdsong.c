@@ -145,6 +145,14 @@ volatile unsigned int freq_count_silence = 0;
 volatile unsigned int switch_mode = 0; // play_mode = 0, record_mode = 1
 volatile unsigned int replay = 0;
 
+// Swoop equation variables
+fix15 pi = float2fix15(3.14);
+fix15 swoop_samples = int2fix15(5200);
+
+// Chirp equation variables
+
+
+
 // This timer ISR is called on core 0
 static void alarm_irq(void) {
 
@@ -159,7 +167,7 @@ static void alarm_irq(void) {
 
     // Finished with replay
     if (replay == 1 && idx > 4) {
-        replay == 0;
+        replay = 0;
     }
 
     // Handle replay of recorded key presses
@@ -178,9 +186,9 @@ static void alarm_irq(void) {
     }
 
     // Key '1' pressed while in play mode
-    if (STATE_KEY1_PRESSED & switch_mode==0) {
-        // Compute frequency for swoop
-        desired_frequency = 260*sin((3.14/5200)*freq_count_swoop) + 1740;
+    if (STATE_KEY1_PRESSED && switch_mode==0) {
+        // Compute frequency for swoop 'y = ksin(mx) + b' -> 'y = -260sin(-pi/5200 * x) + 1740' -> approximate freq curve
+        desired_frequency = 260*sin((3.14/5720)*freq_count_swoop) + 1740;
         phase_incr_main_0 = (desired_frequency*two32)/Fs;
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0;
@@ -205,7 +213,7 @@ static void alarm_irq(void) {
         freq_count_swoop += 1;
         
 
-        if (freq_count_swoop == 5720) {
+        if (freq_count_swoop == BEEP_DURATION) {
             STATE_KEY1_PRESSED = 0;
             current_amplitude_0 = 0;
             freq_count_swoop = 0;
@@ -217,7 +225,7 @@ static void alarm_irq(void) {
     }
 
     // Pressed '1' while in record mode
-    if (STATE_KEY1_PRESSED & switch_mode==1) {
+    if (STATE_KEY1_PRESSED && switch_mode==1) {
         silence_time[idx] = freq_count_silence;
         freq_count_silence = 0;
         buttons_pressed[idx] = 0x11;
@@ -226,9 +234,9 @@ static void alarm_irq(void) {
     }
 
     // Key '2' pressed while in play mode
-    if (STATE_KEY2_PRESSED & switch_mode==0) {
-        // Compute frequency for chirp
-        desired_frequency = (1.84e-4) * pow(freq_count_chirp, 2) + 2000;
+    if (STATE_KEY2_PRESSED && switch_mode==0) {
+        // Compute frequency for chirp 'y = kx^2 + b' -> 'y = (1.53*10^-4)x^2 + 2000' -> approximate freq curve
+        desired_frequency = (1.53e-4) * pow(freq_count_chirp, 2) + 2000;
         phase_incr_main_0 = (desired_frequency*two32)/Fs;
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0;
@@ -252,7 +260,7 @@ static void alarm_irq(void) {
 
         freq_count_chirp += 1;
 
-        if (freq_count_chirp == 5720) {
+        if (freq_count_chirp == BEEP_DURATION) {
             STATE_KEY2_PRESSED = 0;
             current_amplitude_0 = 0;
             freq_count_chirp = 0;
@@ -264,7 +272,7 @@ static void alarm_irq(void) {
     }
 
     // Pressed '2' while in record mode
-    if (STATE_KEY2_PRESSED & switch_mode==1) {
+    if (STATE_KEY2_PRESSED && switch_mode==1) {
         silence_time[idx] = freq_count_silence;
         freq_count_silence = 0;
         buttons_pressed[idx] = 0x21;
@@ -274,7 +282,7 @@ static void alarm_irq(void) {
     
     // No key press while in record mode
     // Save freq_counts to add the silence in between key presses
-    if (STATE_KEY1_PRESSED==0 & STATE_KEY2_PRESSED==0 & switch_mode==1) {
+    if (STATE_KEY1_PRESSED==0 && STATE_KEY2_PRESSED==0 && switch_mode==1) {
         freq_count_silence += 1;
     }
 
