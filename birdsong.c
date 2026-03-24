@@ -65,8 +65,8 @@ typedef signed int fix15 ;
 
 //Direct Digital Synthesis (DDS) parameters
 #define two32 4294967296.0  // 2^32 (a constant)
-#define Fs 44000
-#define DELAY 22 // 1/Fs (in microseconds)
+#define Fs 50000
+#define DELAY 20 // 1/Fs (in microseconds)
 
 volatile unsigned int desired_frequency;
 volatile unsigned int possible_keycode;
@@ -79,6 +79,8 @@ volatile unsigned int phase_incr_main_0 = (400.0*two32)/Fs ;
 // DDS sine table (populated in main())
 #define sine_table_size 256
 fix15 sin_table[sine_table_size] ;
+
+fix15 swoop_sin_table[6501];
 
 // Values output to DAC
 int DAC_output_0 ;
@@ -108,8 +110,11 @@ uint16_t DAC_data_0 ; // output value
 #define LED      25
 #define SPI_PORT spi0
 
-//GPIO for timing the ISR
+// GPIO for timing the ISR
 #define ISR_GPIO 2
+
+// GPIO for misc timing in ISR
+#define ISR_DBG_GPIO 1
 
 // GPIO for External Switch
 #define SWITCH_GPIO 0
@@ -118,7 +123,7 @@ uint16_t DAC_data_0 ; // output value
 #define ATTACK_TIME             1000
 #define DECAY_TIME              1000
 #define SUSTAIN_TIME            3500
-#define BEEP_DURATION           5720
+#define BEEP_DURATION           6500
 
 // Keypad pin configurations
 #define BASE_KEYPAD_PIN 9
@@ -151,6 +156,7 @@ fix15 swoop_samples = int2fix15(5200);
 
 // Chirp equation variables
 
+fix15 num = float2fix15(0.00048);
 
 
 // This timer ISR is called on core 0
@@ -188,8 +194,21 @@ static void alarm_irq(void) {
     // Key '1' pressed while in play mode
     if (STATE_KEY1_PRESSED && switch_mode==0) {
         // Compute frequency for swoop 'y = ksin(mx) + b' -> 'y = -260sin(-pi/5200 * x) + 1740' -> approximate freq curve
-        desired_frequency = 260*sin((3.14/5720)*freq_count_swoop) + 1740;
-        phase_incr_main_0 = (desired_frequency*two32)/Fs;
+        gpio_put(ISR_DBG_GPIO, 1) ;
+        // double sin_val = sinf(fix2float15(multfix15(num, int2fix15(freq_count_swoop))));
+        fix15 sin_val = swoop_sin_table[freq_count_swoop];
+        // double sin_val = sinf((0.00048)*freq_count_swoop);
+        // desired_frequency = 260*sinf((0.00048)*freq_count_swoop) + 1740;
+        gpio_put(ISR_DBG_GPIO, 0) ;
+        // gpio_put(ISR_DBG_GPIO, 1) ;
+        // desired_frequency = 260*sin((0.00048)*freq_count_swoop) + 1740;
+        desired_frequency = fix2int15(multfix15(int2fix15(260), sin_val)) + 1740;
+        // gpio_put(ISR_DBG_GPIO, 0) ;
+        // phase_incr_main_0 = (desired_frequency*two32)/Fs;
+        phase_incr_main_0 = desired_frequency*85899;
+        // int ans = fix2int15(multfix15(int2fix15(22333740), float2fix15(sin_val)));
+        // phase_incr_main_0 = 22333740*sin_val + 149464260;
+        // phase_incr_main_0 = ans + 149464260;
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0;
         DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
@@ -458,6 +477,11 @@ int main() {
     gpio_set_dir(ISR_GPIO, GPIO_OUT);
     gpio_put(ISR_GPIO, 0);
 
+    // Setup the misc ISR-timing GPIO
+    gpio_init(ISR_DBG_GPIO);
+    gpio_set_dir(ISR_DBG_GPIO, GPIO_OUT);
+    gpio_put(ISR_DBG_GPIO, 0);
+
     // Map LDAC pin to GPIO port, hold it low (could alternatively tie to GND)
     gpio_init(LDAC);
     gpio_set_dir(LDAC, GPIO_OUT);
@@ -472,6 +496,10 @@ int main() {
     int ii;
     for (ii = 0; ii < sine_table_size; ii++){
          sin_table[ii] = float2fix15(2047*sin((float)ii*6.283/(float)sine_table_size));
+    }
+
+    for (int i=0; i<6501; i++) {
+        swoop_sin_table[i] =  float2fix15(sinf((3.14/6500)*i));
     }
 
     // Enable the interrupt for the alarm (we're using Alarm 0)
