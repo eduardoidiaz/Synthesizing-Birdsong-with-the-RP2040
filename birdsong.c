@@ -150,14 +150,7 @@ volatile unsigned int freq_count_silence = 0;
 volatile unsigned int switch_mode = 0; // play_mode = 0, record_mode = 1
 volatile unsigned int replay = 0;
 
-// Swoop equation variables
-fix15 pi = float2fix15(3.14);
-fix15 swoop_samples = int2fix15(5200);
-
-// Chirp equation variables
-
-fix15 num = float2fix15(0.00048);
-
+volatile fix15 sin_val = 0;
 
 // This timer ISR is called on core 0
 static void alarm_irq(void) {
@@ -193,22 +186,12 @@ static void alarm_irq(void) {
 
     // Key '1' pressed while in play mode
     if (STATE_KEY1_PRESSED && switch_mode==0) {
-        // Compute frequency for swoop 'y = ksin(mx) + b' -> 'y = -260sin(-pi/5200 * x) + 1740' -> approximate freq curve
+        // Compute frequency for swoop 'y = ksin(mx) + b' -> 'y = -260sin(-pi/6500 * x) + 1740' -> approximate freq curve
         gpio_put(ISR_DBG_GPIO, 1) ;
-        // double sin_val = sinf(fix2float15(multfix15(num, int2fix15(freq_count_swoop))));
-        fix15 sin_val = swoop_sin_table[freq_count_swoop];
-        // double sin_val = sinf((0.00048)*freq_count_swoop);
-        // desired_frequency = 260*sinf((0.00048)*freq_count_swoop) + 1740;
+        sin_val = swoop_sin_table[freq_count_swoop]; // Get precomputed sin() value for specific swoop frequency
         gpio_put(ISR_DBG_GPIO, 0) ;
-        // gpio_put(ISR_DBG_GPIO, 1) ;
-        // desired_frequency = 260*sin((0.00048)*freq_count_swoop) + 1740;
         desired_frequency = fix2int15(multfix15(int2fix15(260), sin_val)) + 1740;
-        // gpio_put(ISR_DBG_GPIO, 0) ;
-        // phase_incr_main_0 = (desired_frequency*two32)/Fs;
         phase_incr_main_0 = desired_frequency*85899;
-        // int ans = fix2int15(multfix15(int2fix15(22333740), float2fix15(sin_val)));
-        // phase_incr_main_0 = 22333740*sin_val + 149464260;
-        // phase_incr_main_0 = ans + 149464260;
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0;
         DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
@@ -254,8 +237,8 @@ static void alarm_irq(void) {
 
     // Key '2' pressed while in play mode
     if (STATE_KEY2_PRESSED && switch_mode==0) {
-        // Compute frequency for chirp 'y = kx^2 + b' -> 'y = (1.53*10^-4)x^2 + 2000' -> approximate freq curve
-        desired_frequency = (1.53e-4) * pow(freq_count_chirp, 2) + 2000;
+        // Compute frequency for chirp 'y = kx^2 + b' -> 'y = (1.18*10^-4)x^2 + 2000' -> approximate freq curve
+        desired_frequency = (1.18e-4) * pow(freq_count_chirp, 2) + 2000;
         phase_incr_main_0 = (desired_frequency*two32)/Fs;
         // DDS phase and sine table lookup
         phase_accum_main_0 += phase_incr_main_0;
