@@ -27,6 +27,9 @@
  * 3.3v (pin 36) -> VCC on DAC 
  * GND (pin 3)  -> GND on DAC 
  * 
+ * EXTERNAL SWITCH CONNECTION
+ * GPIO 0 (pin 1)
+ * 
  */
 
 #include <stdio.h>
@@ -65,6 +68,9 @@ typedef signed int fix15 ;
 #define Fs 50000
 #define DELAY 20 // 1/Fs (in microseconds)
 
+volatile unsigned int desired_frequency;
+volatile unsigned int possible_keycode;
+
 // the DDS units - core 0
 // Phase accumulator and phase increment. Increment sets output frequency.
 volatile unsigned int phase_accum_main_0;
@@ -73,6 +79,8 @@ volatile unsigned int phase_incr_main_0 = (400.0*two32)/Fs ;
 // DDS sine table (populated in main())
 #define sine_table_size 256
 fix15 sin_table[sine_table_size] ;
+
+fix15 swoop_sin_table[6501];
 
 // Values output to DAC
 int DAC_output_0 ;
@@ -102,24 +110,47 @@ uint16_t DAC_data_0 ; // output value
 #define LED      25
 #define SPI_PORT spi0
 
-//GPIO for timing the ISR
+// GPIO for timing the ISR
 #define ISR_GPIO 2
 
+// GPIO for misc timing in ISR
+#define ISR_DBG_GPIO 1
+
+// GPIO for External Switch
+#define SWITCH_GPIO 0
+
 // Timing parameters for beeps (units of interrupts)
-#define ATTACK_TIME             250
-#define DECAY_TIME              250
-#define SUSTAIN_TIME            10000
-#define BEEP_DURATION           10500
-#define BEEP_REPEAT_INTERVAL    200000
+#define ATTACK_TIME             1000
+#define DECAY_TIME              1000
+#define SUSTAIN_TIME            3500
+#define BEEP_DURATION           6500
+
+// Keypad pin configurations
+#define BASE_KEYPAD_PIN 9
+#define KEYROWS         4
+#define NUMKEYS         12
+
+unsigned int keycodes[12] = {   0x28, 0x11, 0x21, 0x41, 0x12,
+                                0x22, 0x42, 0x14, 0x24, 0x44,
+                                0x18, 0x48} ;
+unsigned int scancodes[4] = {   0x01, 0x02, 0x04, 0x08} ;
+unsigned int button = 0x70 ;
+
+volatile unsigned int idx = 0;
+volatile unsigned int buttons_pressed[5] = {0, 0, 0, 0, 0};
+volatile unsigned int silence_time[5] = {0, 0, 0, 0, 0};
+
 
 // State machine variables
-volatile unsigned int STATE_0 = 0 ;
-volatile unsigned int count_0 = 0 ;
+volatile unsigned int STATE_KEY1_PRESSED = 0;
+volatile unsigned int STATE_KEY2_PRESSED = 0;
+volatile unsigned int freq_count_swoop = 0;
+volatile unsigned int freq_count_chirp = 0;
+volatile unsigned int freq_count_silence = 0;
+volatile unsigned int switch_mode = 0; // play_mode = 0, record_mode = 1
+volatile unsigned int replay = 0;
 
-// GPIO ISR. Toggles LED
-void gpio_callback() {
-    gpio_put(LED, !gpio_get(LED));
-}
+volatile fix15 sin_val = 0;
 
 // This timer ISR is called on core 0
 static void alarm_irq(void) {
@@ -133,18 +164,45 @@ static void alarm_irq(void) {
     // Reset the alarm register
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
 
-    if (STATE_0 == 0) {
+    // Finished with replay
+    if (replay == 1 && idx > 4) {
+        replay = 0;
+    }
+
+    // Handle replay of recorded key presses
+    // idx -> is set to 0 initially 
+    // Executes: 
+    // 1. silence_time[idx] interrupts (no sound)
+    // 2. when silence_time[idx] == 0, simulate a recorded key press from buttons_pressed[idx]
+    // 3. once the coresponding key press sound finishes 'idx' is incremented and we restart
+    if (replay == 1 && STATE_KEY1_PRESSED == 0 && STATE_KEY2_PRESSED == 0) {
+        if (silence_time[idx] == 0) {
+            STATE_KEY1_PRESSED = buttons_pressed[idx] == 0x11 ? 1 : 0;
+            STATE_KEY2_PRESSED = buttons_pressed[idx] == 0x21 ? 1 : 0;
+        } else {
+            silence_time[idx] = silence_time[idx] - 1;
+        }
+    }
+
+    // Key '1' pressed while in play mode
+    if (STATE_KEY1_PRESSED && switch_mode==0) {
+        // Compute frequency for swoop 'y = ksin(mx) + b' -> 'y = -260sin(-pi/6500 * x) + 1740' -> approximate freq curve
+        gpio_put(ISR_DBG_GPIO, 1) ;
+        sin_val = swoop_sin_table[freq_count_swoop]; // Get precomputed sin() value for specific swoop frequency
+        gpio_put(ISR_DBG_GPIO, 0) ;
+        desired_frequency = fix2int15(multfix15(int2fix15(260), sin_val)) + 1740;
+        phase_incr_main_0 = desired_frequency*85899;
         // DDS phase and sine table lookup
-        phase_accum_main_0 += phase_incr_main_0  ;
+        phase_accum_main_0 += phase_incr_main_0;
         DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
-            sin_table[phase_accum_main_0>>24])) + 2048 ;
+        sin_table[phase_accum_main_0>>24])) + 2048;
 
         // Ramp up amplitude
-        if (count_0 < ATTACK_TIME) {
+        if (freq_count_swoop < ATTACK_TIME) {
             current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
         }
         // Ramp down amplitude
-        else if (count_0 > BEEP_DURATION - DECAY_TIME) {
+        else if (freq_count_swoop > BEEP_DURATION - DECAY_TIME) {
             current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
         }
 
@@ -154,42 +212,86 @@ static void alarm_irq(void) {
         // SPI write (no spinlock b/c of SPI buffer)
         spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
 
-        // Increment the counter
-        count_0 += 1 ;
+        freq_count_swoop += 1;
+        
 
-        // State transition?
-        if (count_0 == BEEP_DURATION) {
-            STATE_0 = 1 ;
-            count_0 = 0 ;
+        if (freq_count_swoop == BEEP_DURATION) {
+            STATE_KEY1_PRESSED = 0;
+            current_amplitude_0 = 0;
+            freq_count_swoop = 0;
+            // In replay mode increment idx after playing swoop sound
+            if (replay == 1) {
+                idx += 1;
+            }
         }
     }
 
-    // State transition?
-    else {
-        count_0 += 1 ;
-        if (count_0 == BEEP_REPEAT_INTERVAL) {
-            current_amplitude_0 = 0 ;
-            STATE_0 = 0 ;
-            count_0 = 0 ;
+    // Pressed '1' while in record mode
+    if (STATE_KEY1_PRESSED && switch_mode==1) {
+        silence_time[idx] = freq_count_silence;
+        freq_count_silence = 0;
+        buttons_pressed[idx] = 0x11;
+        idx += 1;
+        STATE_KEY1_PRESSED = 0;
+    }
+
+    // Key '2' pressed while in play mode
+    if (STATE_KEY2_PRESSED && switch_mode==0) {
+        // Compute frequency for chirp 'y = kx^2 + b' -> 'y = (1.18*10^-4)x^2 + 2000' -> approximate freq curve
+        desired_frequency = (1.18e-4) * pow(freq_count_chirp, 2) + 2000;
+        phase_incr_main_0 = (desired_frequency*two32)/Fs;
+        // DDS phase and sine table lookup
+        phase_accum_main_0 += phase_incr_main_0;
+        DAC_output_0 = fix2int15(multfix15(current_amplitude_0,
+        sin_table[phase_accum_main_0>>24])) + 2048;
+
+        // Ramp up amplitude
+        if (freq_count_chirp < ATTACK_TIME) {
+            current_amplitude_0 = (current_amplitude_0 + attack_inc) ;
         }
+        // Ramp down amplitude
+        else if (freq_count_chirp > BEEP_DURATION - DECAY_TIME) {
+            current_amplitude_0 = (current_amplitude_0 - decay_inc) ;
+        }
+
+        // Mask with DAC control bits
+        DAC_data_0 = (DAC_config_chan_B | (DAC_output_0 & 0xffff))  ;
+
+        // SPI write (no spinlock b/c of SPI buffer)
+        spi_write16_blocking(SPI_PORT, &DAC_data_0, 1) ;
+
+        freq_count_chirp += 1;
+
+        if (freq_count_chirp == BEEP_DURATION) {
+            STATE_KEY2_PRESSED = 0;
+            current_amplitude_0 = 0;
+            freq_count_chirp = 0;
+            // In replay mode increment idx after playing chirp sound
+            if (replay == 1) {
+                idx += 1;
+            }
+        }
+    }
+
+    // Pressed '2' while in record mode
+    if (STATE_KEY2_PRESSED && switch_mode==1) {
+        silence_time[idx] = freq_count_silence;
+        freq_count_silence = 0;
+        buttons_pressed[idx] = 0x21;
+        idx += 1;
+        STATE_KEY2_PRESSED = 0;
+    }
+    
+    // No key press while in record mode
+    // Save freq_counts to add the silence in between key presses
+    if (STATE_KEY1_PRESSED==0 && STATE_KEY2_PRESSED==0 && switch_mode==1) {
+        freq_count_silence += 1;
     }
 
     // De-assert the GPIO when we leave the interrupt
     gpio_put(ISR_GPIO, 0) ;
 
 }
-
-// Keypad pin configurations
-#define BASE_KEYPAD_PIN 9
-#define KEYROWS         4
-#define NUMKEYS         12
-
-unsigned int keycodes[12] = {   0x28, 0x11, 0x21, 0x41, 0x12,
-                                0x22, 0x42, 0x14, 0x24, 0x44,
-                                0x18, 0x48} ;
-unsigned int scancodes[4] = {   0x01, 0x02, 0x04, 0x08} ;
-unsigned int button = 0x70 ;
-
 
 char keytext[40];
 
@@ -244,74 +346,76 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
     // Indicate thread beginning
     PT_BEGIN(pt) ;
 
-    // Some variables
-    static int possible_keycode;
+    if (replay == 0) {
 
-    while(1) {
+        while(1) {
 
-        switch (current_state) {
-            case STATE_NOT_PRESSED:
-                possible_keycode = scan_keypad();
-                if (possible_keycode == -1) {
-                    current_state = STATE_NOT_PRESSED;
-                } else {
-                    current_state = STATE_MAYBE_PRESSED;
-                }
-                break;
-            case STATE_MAYBE_PRESSED:
-                if (possible_keycode == scan_keypad()) {
-                    // Print key to terminal
-                    for (int i=0; i<NUMKEYS; i++) {
-                        if (possible_keycode == keycodes[i]) {
-                            printf("\n%d", i);
-                            // Raise GPIO 3. This triggers an ISR
-                            gpio_put(3, 1) ;
-                            sleep_ms(150) ;
-                            gpio_put(3, 0) ;
-                            sleep_ms(150) ;
-                            break;
-                        }
+            switch (current_state) {
+                case STATE_NOT_PRESSED:
+                    possible_keycode = scan_keypad();
+                    if (possible_keycode == -1) {
+                        current_state = STATE_NOT_PRESSED;
+                    } else {
+                        current_state = STATE_MAYBE_PRESSED;
                     }
-                    current_state = STATE_PRESSED;
-                } else {
-                    current_state = STATE_NOT_PRESSED;
-                }
-                break;
-            case STATE_PRESSED:
-                if (possible_keycode == scan_keypad()) {
-                    // Do nothing remain in STATE_PRESSED state
-                    current_state = STATE_PRESSED;
-                } else {
-                    current_state = STATE_MAYBE_NOT_PRESSED;
-                }
-                break;
-            case STATE_MAYBE_NOT_PRESSED:
-                if (possible_keycode == scan_keypad()) {
-                    // Transition back to pressed state
-                    current_state = STATE_PRESSED;
-                } else {
-                    current_state = STATE_NOT_PRESSED;
-                }
-                break;
-        }
+                    break;
+                case STATE_MAYBE_PRESSED:
+                    if (possible_keycode == scan_keypad()) {
+                        // Print key to terminal
+                        for (int i=0; i<NUMKEYS; i++) {
+                            if (possible_keycode == keycodes[i]) {
+                                printf("Key Pressed: %d\n", i);
+                                STATE_KEY1_PRESSED = (possible_keycode == keycodes[1]);
+                                STATE_KEY2_PRESSED = (possible_keycode == keycodes[2]);
+                                break;
+                            }
+                        }
+                        current_state = STATE_PRESSED;
+                    } else {
+                        current_state = STATE_NOT_PRESSED;
+                    }
+                    break;
+                case STATE_PRESSED:
+                    if (possible_keycode == scan_keypad()) {
+                        // Do nothing remain in STATE_PRESSED state
+                        current_state = STATE_PRESSED;
+                    } else {
+                        current_state = STATE_MAYBE_NOT_PRESSED;
+                    }
+                    break;
+                case STATE_MAYBE_NOT_PRESSED:
+                    if (possible_keycode == scan_keypad()) {
+                        // Transition back to pressed state
+                        current_state = STATE_PRESSED;
+                    } else {
+                        current_state = STATE_NOT_PRESSED;
+                    }
+                    break;
+            }
 
-        PT_YIELD_usec(30000) ;
+            PT_YIELD_usec(30000) ;
+        }
     }
     // Indicate thread end
     PT_END(pt) ;
 }
 
-#define WATCH_PIN 1
+// GPIO ISR. Detects External Switch Toggle
+void switch_gpio_record_callback() {
+    if (switch_mode == 0) {
+        printf("Record!\n");
+        switch_mode = 1;
+    } else {
+        printf("Replay!\n");
+        switch_mode = 0;
+        idx = 0;
+        replay = 1;
+    }
+}
+
 int main() {
-
-    // Overclock
-    set_sys_clock_khz(150000, true) ;
-
     // Initialize stdio
     stdio_init_all();
-
-    // Configure GPIO interrupt
-    gpio_set_irq_enabled_with_callback(WATCH_PIN, GPIO_IRQ_EDGE_RISE, true, &gpio_callback);
 
     // Map LED to GPIO port, make it low
     gpio_init(LED);
@@ -319,27 +423,29 @@ int main() {
     // Set LED to zero
     gpio_put(LED, 0);
 
-    // Set GPIO's 3 to output
-    gpio_init(3);
-    gpio_set_dir(3, GPIO_OUT);
-    // Set GPIO 3 to zero
-    gpio_put(3, 0) ;
+    // Configure Switch (record) GPIO interrupt
+    gpio_set_irq_enabled_with_callback(0, GPIO_IRQ_EDGE_RISE, true, &switch_gpio_record_callback);
+
+    // Set GPIO 0 to input
+    gpio_init(SWITCH_GPIO);
+    gpio_set_dir(SWITCH_GPIO, GPIO_IN);
+    gpio_put(SWITCH_GPIO, 0);
 
     ////////////////// KEYPAD INITS ///////////////////////
     // Initialize the keypad GPIO's
-    gpio_init_mask((0x7F << BASE_KEYPAD_PIN)) ;
+    gpio_init_mask((0x7F << BASE_KEYPAD_PIN));
     // Set row-pins to output
-    gpio_set_dir_out_masked((0xF << BASE_KEYPAD_PIN)) ;
+    gpio_set_dir_out_masked((0xF << BASE_KEYPAD_PIN));
     // Set all output pins to low
-    gpio_put_masked((0xF << BASE_KEYPAD_PIN), (0x0 << BASE_KEYPAD_PIN)) ;
+    gpio_put_masked((0xF << BASE_KEYPAD_PIN), (0x0 << BASE_KEYPAD_PIN));
     // Turn on pulldown resistors for column pins (on by default)
-    gpio_pull_down((BASE_KEYPAD_PIN + 4)) ;
-    gpio_pull_down((BASE_KEYPAD_PIN + 5)) ;
-    gpio_pull_down((BASE_KEYPAD_PIN + 6)) ;
+    gpio_pull_down((BASE_KEYPAD_PIN + 4));
+    gpio_pull_down((BASE_KEYPAD_PIN + 5));
+    gpio_pull_down((BASE_KEYPAD_PIN + 6));
 
     ////////////////// DAC INITS ///////////////////////
     // Initialize SPI channel (channel, baud rate set to 20MHz)
-    spi_init(SPI_PORT, 20000000) ;
+    spi_init(SPI_PORT, 20000000);
     // Format (channel, data bits per transfer, polarity, phase, order)
     spi_set_format(SPI_PORT, 16, 0, 0, 0);
 
@@ -347,16 +453,26 @@ int main() {
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+    gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
+
+    // Setup the ISR-timing GPIO
+    gpio_init(ISR_GPIO);
+    gpio_set_dir(ISR_GPIO, GPIO_OUT);
+    gpio_put(ISR_GPIO, 0);
+
+    // Setup the misc ISR-timing GPIO
+    gpio_init(ISR_DBG_GPIO);
+    gpio_set_dir(ISR_DBG_GPIO, GPIO_OUT);
+    gpio_put(ISR_DBG_GPIO, 0);
 
     // Map LDAC pin to GPIO port, hold it low (could alternatively tie to GND)
-    gpio_init(LDAC) ;
-    gpio_set_dir(LDAC, GPIO_OUT) ;
-    gpio_put(LDAC, 0) ;
+    gpio_init(LDAC);
+    gpio_set_dir(LDAC, GPIO_OUT);
+    gpio_put(LDAC, 0);
 
     // set up increments for calculating bow envelope
-    attack_inc = divfix(max_amplitude, int2fix15(ATTACK_TIME)) ;
-    decay_inc =  divfix(max_amplitude, int2fix15(DECAY_TIME)) ;
+    attack_inc = divfix(max_amplitude, int2fix15(ATTACK_TIME));
+    decay_inc =  divfix(max_amplitude, int2fix15(DECAY_TIME));
 
     // Build the sine lookup table
     // scaled to produce values between 0 and 4096 (for 12-bit DAC)
@@ -365,14 +481,18 @@ int main() {
          sin_table[ii] = float2fix15(2047*sin((float)ii*6.283/(float)sine_table_size));
     }
 
+    for (int i=0; i<6501; i++) {
+        swoop_sin_table[i] =  float2fix15(sinf((3.14/6500)*i));
+    }
+
     // Enable the interrupt for the alarm (we're using Alarm 0)
-    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM) ;
+    hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM);
     // Associate an interrupt handler with the ALARM_IRQ
-    irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
+    irq_set_exclusive_handler(ALARM_IRQ, alarm_irq);
     // Enable the alarm interrupt
-    irq_set_enabled(ALARM_IRQ, true) ;
+    irq_set_enabled(ALARM_IRQ, true);
     // Write the lower 32 bits of the target time to the alarm register, arming it.
-    timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY ;
+    timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
 
 
     // Add core 0 threads
